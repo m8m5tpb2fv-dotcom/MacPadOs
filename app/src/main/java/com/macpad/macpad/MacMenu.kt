@@ -62,13 +62,19 @@ class MacMenu(private val host: DesktopHost) {
         keyboard: Boolean = false,
         onHorizontalKey: ((Int) -> Unit)? = null,
         onDismiss: (() -> Unit)? = null,
+        touchModal: Boolean = true,
     ) {
         val loc = IntArray(2)
         anchor.getLocationOnScreen(loc)
-        showAtScreen(loc[0] + xOffset, loc[1] + anchor.height + yOffset, entries, minWidthPx, keyboard, onHorizontalKey, onDismiss)
+        showAtScreen(loc[0] + xOffset, loc[1] + anchor.height + yOffset, entries, minWidthPx, keyboard, onHorizontalKey, onDismiss, touchModal)
     }
 
-    /** Shows the menu with its top-left corner at screen position ([x], [y]), kept on screen. */
+    /**
+     * Shows the menu with its top-left corner at screen position ([x], [y]), kept on screen.
+     * With [touchModal] = false, touches and mouse hover outside the menu also reach the views
+     * below (the menu still closes on an outside tap) — used by the menu bar so that hovering
+     * another title switches menus like on macOS.
+     */
     fun showAtScreen(
         x: Int,
         y: Int,
@@ -77,6 +83,7 @@ class MacMenu(private val host: DesktopHost) {
         keyboard: Boolean = false,
         onHorizontalKey: ((Int) -> Unit)? = null,
         onDismiss: (() -> Unit)? = null,
+        touchModal: Boolean = true,
     ) {
         dismiss()
         if (entries.isEmpty()) return
@@ -162,6 +169,7 @@ class MacMenu(private val host: DesktopHost) {
         )
         pw.elevation = ctx.dpf(18f)
         pw.isOutsideTouchable = true
+        pw.isTouchModal = touchModal
         pw.inputMethodMode = PopupWindow.INPUT_METHOD_NOT_NEEDED
         pw.animationStyle = 0
         pw.setOnDismissListener {
