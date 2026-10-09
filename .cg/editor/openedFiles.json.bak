@@ -1,0 +1,21 @@
+{
+  "allFiles": [
+    {
+      "file": "/storage/emulated/0/CodeOnTheGoProjects/MacPad /app/src/main/AndroidManifest.xml",
+      "selection": {
+        "end": {
+          "column": 27,
+          "index": 827,
+          "line": 25
+        },
+        "start": {
+          "column": 27,
+          "index": 827,
+          "line": 25
+        }
+      }
+    }
+  ],
+  "projectPath": "/storage/emulated/0/CodeOnTheGoProjects/MacPad ",
+  "selectedFile": "/storage/emulated/0/CodeOnTheGoProjects/MacPad /app/src/main/AndroidManifest.xml"
+}
