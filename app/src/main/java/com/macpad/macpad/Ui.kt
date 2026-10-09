@@ -7,10 +7,12 @@ import android.animation.ValueAnimator
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
+import android.graphics.BitmapShader
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorFilter
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Outline
 import android.graphics.Paint
 import android.graphics.Path
@@ -447,7 +449,7 @@ interface GlassSource {
     val blurredWallpaper: Bitmap?
 
     /** Maps a rectangle in screen coordinates to a source rectangle inside [blurredWallpaper]. */
-    fun mapScreenRect(screen: RectF, out: Rect): Boolean
+    fun mapScreenRect(screen: RectF, out: RectF): Boolean
 
     /** Registers a view whose background is glass, so it is redrawn when the wallpaper changes. */
     fun registerGlassView(view: View)
@@ -474,9 +476,11 @@ class GlassDrawable(
 
     private val loc = IntArray(2)
     private val screen = RectF()
-    private val src = Rect()
+    private val src = RectF()
     private val dst = RectF()
-    private val path = Path()
+    private val shaderMatrix = Matrix()
+    private var shaderBitmap: Bitmap? = null
+    private var shader: BitmapShader? = null
     private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
     private val tintPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
@@ -489,33 +493,41 @@ class GlassDrawable(
         val b = bounds
         if (b.isEmpty) return
         dst.set(b)
-        path.reset()
-        path.addRoundRect(dst, radius, radius, Path.Direction.CW)
         val bmp = source.blurredWallpaper
-        canvas.save()
-        canvas.clipPath(path)
+        var drewWallpaper = false
         if (bmp != null && !bmp.isRecycled) {
             host.getLocationOnScreen(loc)
             screen.set(
                 (loc[0] + b.left).toFloat(),
                 (loc[1] + b.top).toFloat(),
-                (loc[0] + b.left + b.width() * host.scaleX),
-                (loc[1] + b.top + b.height() * host.scaleY),
+                loc[0] + b.left + b.width() * host.scaleX,
+                loc[1] + b.top + b.height() * host.scaleY,
             )
-            if (source.mapScreenRect(screen, src)) canvas.drawBitmap(bmp, src, dst, bmpPaint)
-            tintPaint.color = tintColor
-        } else {
-            tintPaint.color = fallbackTint
+            if (source.mapScreenRect(screen, src) && src.width() > 0f && src.height() > 0f) {
+                if (shaderBitmap !== bmp) {
+                    shader = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                    shaderBitmap = bmp
+                    bmpPaint.shader = shader
+                }
+                shaderMatrix.setRectToRect(src, dst, Matrix.ScaleToFit.FILL)
+                shader?.setLocalMatrix(shaderMatrix)
+                drawShape(canvas, bmpPaint)
+                drewWallpaper = true
+            }
         }
-        canvas.drawRect(dst, tintPaint)
-        canvas.restore()
+        tintPaint.color = if (drewWallpaper) tintColor else fallbackTint
+        drawShape(canvas, tintPaint)
         if (strokeWidth > 0f && Color.alpha(strokeColor) > 0) {
             strokePaint.color = strokeColor
             strokePaint.strokeWidth = strokeWidth
             val h = strokeWidth / 2
             dst.inset(h, h)
-            canvas.drawRoundRect(dst, radius - h, radius - h, strokePaint)
+            if (radius > 0f) canvas.drawRoundRect(dst, radius - h, radius - h, strokePaint) else canvas.drawRect(dst, strokePaint)
         }
+    }
+
+    private fun drawShape(canvas: Canvas, paint: Paint) {
+        if (radius > 0f) canvas.drawRoundRect(dst, radius, radius, paint) else canvas.drawRect(dst, paint)
     }
 
     override fun getOutline(outline: Outline) {

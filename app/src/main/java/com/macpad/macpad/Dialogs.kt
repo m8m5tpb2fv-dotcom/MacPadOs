@@ -34,6 +34,14 @@ class DialogLayer(private val host: DesktopHost, private val root: FrameLayout) 
 
     val isShowing: Boolean get() = stack.isNotEmpty()
 
+    /** Space taken by the on-screen keyboard; dialogs are centred above it. */
+    var bottomInset: Int = 0
+        set(value) {
+            if (field == value) return
+            field = value
+            stack.forEach { it.overlay.setPadding(0, 0, 0, value) }
+        }
+
     /**
      * Shows a dialog. [content] (optional) is placed between the message and the buttons.
      * [onShown] receives the panel after it is attached (e.g. to focus a field).
@@ -52,6 +60,7 @@ class DialogLayer(private val host: DesktopHost, private val root: FrameLayout) 
             setBackgroundColor(p.dimOverlay)
             isClickable = true
             isFocusable = false
+            setPadding(0, 0, 0, bottomInset)
         }
         val panel = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL

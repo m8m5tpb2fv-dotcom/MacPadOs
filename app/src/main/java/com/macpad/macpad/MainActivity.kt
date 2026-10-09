@@ -140,7 +140,6 @@ class MainActivity : AppCompatActivity(), DesktopHost {
         apps = AppRepository(this)
         menus = MacMenu(this)
         buildDesktop()
-        dialogs = DialogLayer(this, root)
 
         wallpaper.onError = { toast(it) }
         wallpaper.apply(force = true)
@@ -209,6 +208,8 @@ class MainActivity : AppCompatActivity(), DesktopHost {
         // Children may draw outside their bounds (Dock magnification and hover labels).
         root = FrameLayout(this).apply { clipChildren = false }
         setContentView(root)
+        // Created before the components so they may use host.dialogs right away.
+        dialogs = DialogLayer(this, root)
 
         wallpaperView = WallpaperView(this)
         root.addView(wallpaperView, matchParent())
@@ -279,6 +280,7 @@ class MainActivity : AppCompatActivity(), DesktopHost {
             leftMargin = i.left
             rightMargin = i.right
         }
+        dialogs.bottomInset = imeBottom
     }
 
     private inline fun updateLp(v: View, block: FrameLayout.LayoutParams.() -> Unit) {

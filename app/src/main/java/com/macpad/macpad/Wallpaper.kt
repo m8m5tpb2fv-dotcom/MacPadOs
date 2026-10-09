@@ -28,7 +28,6 @@ import java.io.IOException
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.Executors
-import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -455,7 +454,7 @@ class WallpaperController(
         glassViews.add(view)
     }
 
-    override fun mapScreenRect(screen: RectF, out: Rect): Boolean {
+    override fun mapScreenRect(screen: RectF, out: RectF): Boolean {
         val blurred = blurredWallpaper ?: return false
         val src = view.currentBitmap ?: return false
         view.getLocationOnScreen(loc)
@@ -464,16 +463,8 @@ class WallpaperController(
         if (!view.mapViewRectToBitmap(tmp)) return false
         val sx = blurred.width / src.width.toFloat()
         val sy = blurred.height / src.height.toFloat()
-        out.set(
-            (tmp.left * sx).toInt(),
-            (tmp.top * sy).toInt(),
-            ceil(tmp.right * sx).toInt(),
-            ceil(tmp.bottom * sy).toInt(),
-        )
-        if (!out.intersect(0, 0, blurred.width, blurred.height)) return false
-        if (out.width() < 1) out.right = (out.left + 1).coerceAtMost(blurred.width)
-        if (out.height() < 1) out.bottom = (out.top + 1).coerceAtMost(blurred.height)
-        return !out.isEmpty
+        out.set(tmp.left * sx, tmp.top * sy, tmp.right * sx, tmp.bottom * sy)
+        return out.width() > 0f && out.height() > 0f
     }
 
     companion object {
