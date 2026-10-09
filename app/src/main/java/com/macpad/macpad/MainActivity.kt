@@ -1,541 +1,700 @@
-
 package com.macpad.macpad
 
+import android.animation.ValueAnimator
+import android.app.role.RoleManager
+import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
+import android.graphics.PointF
+import android.graphics.Rect
+import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.text.Editable
-import android.text.TextWatcher
+import android.provider.Settings
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.inputmethod.EditorInfo
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import android.view.WindowManager as AndroidWindowManager
 import android.view.inputmethod.InputMethodManager
-import android.widget.*
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContract
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import kotlin.math.max
 
-data class AppItem(
-    val name: String,
-    val packageName: String,
-    val icon: android.graphics.drawable.Drawable
-)
+/**
+ * MacPad's only activity: the desktop (Home screen). It owns the layers
+ * (wallpaper → desktop shortcuts → windows → Dock → menu bar → Launchpad/Spotlight → dialogs),
+ * global keyboard shortcuts, system insets and the Storage Access Framework launchers, and
+ * implements [DesktopHost] for all components.
+ */
+class MainActivity : AppCompatActivity(), DesktopHost {
 
-class MainActivity : AppCompatActivity() {
+    override val activity: AppCompatActivity get() = this
+    override val context: Context get() = this
 
-    private val bg = Color.rgb(20, 24, 36)
-    private val panel = Color.rgb(43, 49, 65)
-    private val white = Color.rgb(248, 249, 255)
-    private val muted = Color.rgb(177, 187, 207)
-    private val blue = Color.rgb(145, 199, 255)
-    private val accent = Color.rgb(93, 151, 235)
+    override var palette: Palette = Palette.dark()
+        private set
+    override lateinit var prefs: MacPrefs
+        private set
+    override lateinit var apps: AppRepository
+        private set
+    override lateinit var windows: WindowManager
+        private set
+    override val glass: GlassSource get() = wallpaper
+    override lateinit var menus: MacMenu
+        private set
+    override lateinit var dialogs: DialogLayer
+        private set
+    override val animationsEnabled: Boolean
+        get() = !prefs.reduceMotion && ValueAnimator.areAnimatorsEnabled()
+    override val systemInsets = Rect()
 
-    private lateinit var root: LinearLayout
-    private lateinit var appGrid: GridLayout
-    private lateinit var search: EditText
-    private lateinit var clockView: TextView
-    private lateinit var allApps: List<AppItem>
+    private lateinit var root: FrameLayout
+    private lateinit var wallpaperView: WallpaperView
+    private lateinit var wallpaper: WallpaperController
+    private lateinit var desktop: DesktopIconsLayer
+    private lateinit var windowLayer: FrameLayout
+    private lateinit var dock: Dock
+    private lateinit var menuBar: MenuBar
+    private lateinit var launchpad: Launchpad
+    private lateinit var spotlight: Spotlight
 
-    private val handler = Handler(Looper.getMainLooper())
+    private var imeBottom = 0
+    private var appliedThemeKey = ""
 
-    private val clockUpdater = object : Runnable {
-        override fun run() {
-            if (::clockView.isInitialized) {
-                clockView.text = SimpleDateFormat(
-                    "EEE, d MMM  HH:mm",
-                    Locale.getDefault()
-                ).format(Date())
-            }
-            handler.postDelayed(this, 30_000)
-        }
+    // ---- Storage Access Framework / role requests -------------------------------------------
+
+    private var folderCallback: ((Uri?) -> Unit)? = null
+    private var fileCallback: ((Uri?) -> Unit)? = null
+    private var createCallback: ((Uri?) -> Unit)? = null
+
+    private val openTree = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val cb = folderCallback
+        folderCallback = null
+        cb?.invoke(uri)
     }
+
+    private val openDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val cb = fileCallback
+        fileCallback = null
+        cb?.invoke(uri)
+    }
+
+    /** ACTION_CREATE_DOCUMENT with a MIME type chosen per call (the stock contract fixes it). */
+    private val createDocumentContract = object : ActivityResultContract<Pair<String, String>, Uri?>() {
+        override fun createIntent(context: Context, input: Pair<String, String>): Intent =
+            Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType(input.first)
+                .putExtra(Intent.EXTRA_TITLE, input.second)
+
+        override fun parseResult(resultCode: Int, intent: Intent?): Uri? =
+            if (resultCode == RESULT_OK) intent?.data else null
+    }
+
+    private val createDocumentLauncher = registerForActivityResult(createDocumentContract) { uri ->
+        val cb = createCallback
+        createCallback = null
+        cb?.invoke(uri)
+    }
+
+    private val roleRequest = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        toast(if (isDefaultLauncher()) "MacPad теперь главный экран" else "Главный экран не изменён")
+        (windows.find(SettingsWindow.ID) as? SettingsWindow)?.rebuild()
+    }
+
+    private val appsListener: () -> Unit = {
+        launchpad.onAppsChanged()
+        spotlight.onAppsChanged()
+        dock.onAppsChanged()
+        desktop.onAppsChanged()
+    }
+
+    private val windowsListener: () -> Unit = {
+        menuBar.onWindowsChanged()
+        dock.onWindowsChanged()
+    }
+
+    // ---- Lifecycle ----------------------------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        prefs = MacPrefs(this)
+        palette = resolvePalette()
+        appliedThemeKey = themeKey()
 
-        window.statusBarColor = bg
-        window.navigationBarColor = bg
-
-        if (android.os.Build.VERSION.SDK_INT >= 29) {
-            window.isNavigationBarContrastEnforced = false
-            window.isStatusBarContrastEnforced = false
+        window.setDecorFitsSystemWindows(false)
+        window.isNavigationBarContrastEnforced = false
+        window.attributes = window.attributes.apply {
+            layoutInDisplayCutoutMode = AndroidWindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
 
-        buildInterface()
-        loadApps()
-        renderApps("")
-        clockUpdater.run()
+        apps = AppRepository(this)
+        menus = MacMenu(this)
+        buildDesktop()
+        dialogs = DialogLayer(this, root)
+
+        wallpaper.onError = { toast(it) }
+        wallpaper.apply(force = true)
+        wallpaperView.fallbackColor = if (palette.dark) Color.rgb(28, 28, 30) else Color.rgb(222, 222, 228)
+
+        apps.addListener(appsListener)
+        windows.addListener(windowsListener)
+        apps.start()
+
+        setupBackHandling()
+        applySystemBars()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        menuBar.onStart()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Apps may have been installed/removed while another app was in front.
+        apps.refreshIfChanged()
+        if (appliedThemeKey != themeKey()) applySettings()
+    }
+
+    override fun onStop() {
+        menuBar.onStop()
+        menus.dismiss()
+        super.onStop()
     }
 
     override fun onDestroy() {
-        handler.removeCallbacks(clockUpdater)
+        apps.removeListener(appsListener)
+        windows.removeListener(windowsListener)
+        apps.shutdown()
+        wallpaper.shutdown()
         super.onDestroy()
     }
 
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density).toInt()
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) applySystemBars()
+    }
 
-    private fun rounded(
-        color: Int,
-        radius: Float,
-        strokeColor: Int = Color.TRANSPARENT
-    ): GradientDrawable {
-        return GradientDrawable().apply {
-            setColor(color)
-            cornerRadius = radius
-            if (strokeColor != Color.TRANSPARENT) {
-                setStroke(dp(1), strokeColor)
-            }
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // Orientation/size changes are handled in place (configChanges in the manifest) so open
+        // windows survive rotation; only the system theme may need a re-theme.
+        if (prefs.themeMode == "system" && appliedThemeKey != themeKey()) applySettings()
+        root.post { updateLayout() }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (Intent.ACTION_MAIN == intent.action && intent.hasCategory(Intent.CATEGORY_HOME)) {
+            // Home pressed while MacPad is already in front: close transient UI.
+            menus.dismiss()
+            hideSpotlight()
+            hideLaunchpad()
         }
     }
 
-    private fun text(
-        value: String,
-        size: Float,
-        color: Int,
-        bold: Boolean = false
-    ) = TextView(this).apply {
-        text = value
-        textSize = size
-        setTextColor(color)
-        if (bold) setTypeface(null, Typeface.BOLD)
-        gravity = Gravity.CENTER_VERTICAL
-    }
+    // ---- Layout -------------------------------------------------------------------------------
 
-    private fun buildInterface() {
-        root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(bg)
-            setPadding(dp(20), dp(8), dp(20), dp(8))
-        }
-
+    private fun buildDesktop() {
+        // Children may draw outside their bounds (Dock magnification and hover labels).
+        root = FrameLayout(this).apply { clipChildren = false }
         setContentView(root)
 
-        // Верхняя строка меню
-        val menu = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = rounded(panel, dp(15).toFloat())
-            setPadding(dp(14), 0, dp(14), 0)
-        }
+        wallpaperView = WallpaperView(this)
+        root.addView(wallpaperView, matchParent())
+        wallpaper = WallpaperController(this, wallpaperView, prefs)
 
-        menu.addView(
-            text("●", 16f, blue, true),
-            LinearLayout.LayoutParams(-2, dp(44))
-        )
+        desktop = DesktopIconsLayer(this)
+        root.addView(desktop, matchParent())
 
-        menu.addView(
-            text("  MacPad", 15f, white, true),
-            LinearLayout.LayoutParams(-2, dp(44))
-        )
+        windowLayer = FrameLayout(this)
+        root.addView(windowLayer, matchParent())
+        windows = WindowManager(this, windowLayer)
 
-        menu.addView(
-            text("   Файл    Вид    Окно", 12f, muted),
-            LinearLayout.LayoutParams(0, dp(44), 1f)
-        )
-
-        clockView = text("", 12f, white)
-
-        menu.addView(
-            clockView,
-            LinearLayout.LayoutParams(-2, dp(44))
-        )
-
-        root.addView(
-            menu,
-            LinearLayout.LayoutParams(-1, dp(46))
-        )
-
-        // Приветствие
-        root.addView(
-            text("Рабочий стол", 30f, white, true),
-            LinearLayout.LayoutParams(-1, dp(48)).apply {
-                topMargin = dp(16)
-            }
-        )
-
-        root.addView(
-            text("Твой планшет. Твоё пространство.", 14f, muted),
-            LinearLayout.LayoutParams(-1, dp(26))
-        )
-
-        // Поиск
-        search = EditText(this).apply {
-            hint = "⌕   Поиск приложений..."
-            setHintTextColor(muted)
-            setTextColor(white)
-            textSize = 16f
-            setSingleLine(true)
-            imeOptions = EditorInfo.IME_ACTION_SEARCH
-            background = rounded(panel, dp(16).toFloat(), Color.rgb(62, 72, 92))
-            setPadding(dp(16), 0, dp(16), 0)
-            isFocusableInTouchMode = true
-
-            addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(
-                    s: CharSequence?, start: Int, count: Int, after: Int
-                ) {}
-
-                override fun onTextChanged(
-                    s: CharSequence?, start: Int, before: Int, count: Int
-                ) {
-                    renderApps(s?.toString().orEmpty())
-                }
-
-                override fun afterTextChanged(s: Editable?) {}
-            })
-
-            setOnEditorActionListener { _, actionId, _ ->
-                if (actionId == EditorInfo.IME_ACTION_SEARCH) {
-                    launchFirstSearchResult()
-                    true
-                } else false
-            }
-        }
-
-        root.addView(
-            search,
-            LinearLayout.LayoutParams(-1, dp(50)).apply {
-                topMargin = dp(14)
-                bottomMargin = dp(14)
-            }
-        )
-
-        // Заголовок сетки
-        val appsHeader = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        appsHeader.addView(
-            text("Приложения", 18f, white, true),
-            LinearLayout.LayoutParams(0, dp(38), 1f)
-        )
-
-        appsHeader.addView(
-            text("Ctrl + Space  ·  Поиск", 11f, muted)
-        )
-
-        root.addView(
-            appsHeader,
-            LinearLayout.LayoutParams(-1, dp(38))
-        )
-
-        // Сетка приложений
-        val scroll = ScrollView(this).apply {
-            isFillViewport = false
-            overScrollMode = View.OVER_SCROLL_IF_CONTENT_SCROLLS
-        }
-
-        appGrid = GridLayout(this).apply {
-            columnCount = 5
-            alignmentMode = GridLayout.ALIGN_BOUNDS
-            useDefaultMargins = false
-        }
-
-        scroll.addView(
-            appGrid,
-            ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-
-        root.addView(
-            scroll,
-            LinearLayout.LayoutParams(-1, 0, 1f)
-        )
-
-        // Док
-        val dock = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            background = rounded(
-                Color.rgb(48, 57, 76),
-                dp(23).toFloat(),
-                Color.rgb(72, 83, 105)
-            )
-            setPadding(dp(7), dp(7), dp(7), dp(7))
-        }
-
-        addDockItem(dock, "⌂", "Домой") {
-            search.setText("")
-            search.clearFocus()
-            hideKeyboard()
-        }
-
-        addDockItem(dock, "▦", "Программы") {
-            search.setText("")
-            search.clearFocus()
-        }
-
-        addDockItem(dock, "⌕", "Поиск") {
-            focusSearch()
-        }
-
-        addDockItem(dock, "⚙", "Настройки") {
-            openSettings()
-        }
-
+        dock = Dock(this)
         root.addView(
             dock,
-            LinearLayout.LayoutParams(-1, -2).apply {
-                topMargin = dp(10)
-                bottomMargin = dp(3)
-            }
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL),
         )
 
-        // Подсказка внизу
-        root.addView(
-            text("MacPad  •  Android Desktop", 10f, muted).apply {
-                gravity = Gravity.CENTER
-            },
-            LinearLayout.LayoutParams(-1, dp(19)).apply {
-                topMargin = dp(3)
-            }
-        )
-    }
+        menuBar = MenuBar(this)
+        root.addView(menuBar, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, menuBar.barHeightPx, Gravity.TOP))
 
-    private fun addDockItem(
-        dock: LinearLayout,
-        symbol: String,
-        label: String,
-        action: () -> Unit
-    ) {
-        val item = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            isClickable = true
-            isFocusable = true
-            background = rounded(Color.TRANSPARENT, dp(14).toFloat())
-            setOnClickListener { action() }
+        launchpad = Launchpad(this).apply { visibility = View.GONE }
+        root.addView(launchpad, matchParent())
+
+        spotlight = Spotlight(this).apply { visibility = View.GONE }
+        root.addView(spotlight, matchParent())
+
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
+            val ime = insets.getInsets(WindowInsets.Type.ime())
+            systemInsets.set(bars.left, bars.top, bars.right, bars.bottom)
+            imeBottom = ime.bottom
+            updateLayout()
+            WindowInsets.CONSUMED
         }
+        dock.addOnLayoutChangeListener { _, _, t, _, b, _, ot, _, ob ->
+            if (b - t != ob - ot) root.post { updateLayout() }
+        }
+        windowLayer.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+            if (r - l != or - ol || b - t != ob - ot) windows.onLayerResized()
+        }
+    }
 
-        item.addView(
-            text(symbol, 27f, blue).apply {
-                gravity = Gravity.CENTER
-            },
-            LinearLayout.LayoutParams(-1, dp(34))
-        )
+    private fun matchParent() = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
 
-        item.addView(
-            text(label, 10f, muted).apply {
-                gravity = Gravity.CENTER
+    /** Positions the menu bar, Dock and the desktop/window layers around the system insets. */
+    private fun updateLayout() {
+        val i = systemInsets
+        menuBar.setPadding(i.left, i.top, i.right, 0)
+        updateLp(menuBar) { height = menuBar.barHeightPx + i.top }
+        val dockBottom = i.bottom + dp(8)
+        updateLp(dock) {
+            bottomMargin = dockBottom
+            leftMargin = i.left
+            rightMargin = i.right
+        }
+        val dockReserve = (if (dock.height > 0) dock.height else dp(76)) + dockBottom + dp(6)
+        val top = menuBar.barHeightPx + i.top
+        updateLp(windowLayer) {
+            topMargin = top
+            bottomMargin = max(dockReserve, imeBottom)
+            leftMargin = i.left
+            rightMargin = i.right
+        }
+        updateLp(desktop) {
+            topMargin = top
+            bottomMargin = dockReserve
+            leftMargin = i.left
+            rightMargin = i.right
+        }
+    }
+
+    private inline fun updateLp(v: View, block: FrameLayout.LayoutParams.() -> Unit) {
+        val lp = v.layoutParams as FrameLayout.LayoutParams
+        val before = intArrayOf(lp.width, lp.height, lp.leftMargin, lp.topMargin, lp.rightMargin, lp.bottomMargin)
+        lp.block()
+        val after = intArrayOf(lp.width, lp.height, lp.leftMargin, lp.topMargin, lp.rightMargin, lp.bottomMargin)
+        if (!before.contentEquals(after)) v.layoutParams = lp
+    }
+
+    // ---- Theme & settings ---------------------------------------------------------------------
+
+    private fun isSystemNight(): Boolean =
+        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+
+    private fun resolvePalette(): Palette = when (prefs.themeMode) {
+        "light" -> Palette.light()
+        "system" -> if (isSystemNight()) Palette.dark() else Palette.light()
+        else -> Palette.dark()
+    }
+
+    private fun themeKey(): String = prefs.themeMode + if (prefs.themeMode == "system") isSystemNight().toString() else ""
+
+    override fun applySettings() {
+        val newPalette = resolvePalette()
+        val paletteChanged = newPalette != palette
+        palette = newPalette
+        appliedThemeKey = themeKey()
+        wallpaper.apply()
+        wallpaperView.fallbackColor = if (palette.dark) Color.rgb(28, 28, 30) else Color.rgb(222, 222, 228)
+        applySystemBars()
+        menus.dismiss()
+        menuBar.applyPalette()
+        dock.applyPalette()
+        desktop.applyPalette()
+        launchpad.applyPalette()
+        spotlight.applyPalette()
+        if (paletteChanged) windows.applyPalette()
+        root.post { updateLayout() }
+    }
+
+    private fun applySystemBars() {
+        val c = window.insetsController ?: return
+        if (prefs.hideStatusBar) {
+            c.hide(WindowInsets.Type.statusBars())
+            c.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            c.show(WindowInsets.Type.statusBars())
+        }
+        val mask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+        c.setSystemBarsAppearance(if (palette.dark) 0 else mask, mask)
+    }
+
+    // ---- DesktopHost: apps --------------------------------------------------------------------
+
+    override fun toast(text: String) {
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+    }
+
+    override fun launchApp(entry: AppEntry, source: View?) {
+        when (apps.launch(this, entry, source)) {
+            LaunchResult.OK -> {
+                dock.bounce(entry.key)
+                if (launchpad.isShowing) launchpad.hide()
+                if (spotlight.isShowing) spotlight.hide()
             }
+            LaunchResult.PROFILE_PAUSED -> dialogs.alert(
+                "Рабочий профиль приостановлен",
+                "Приложение «${entry.label}» находится в приостановленном рабочем профиле. " +
+                    "Включите рабочие приложения в настройках Android и повторите попытку.",
+            )
+            LaunchResult.FAILED -> dialogs.alert(
+                "Не удалось открыть «${entry.label}»",
+                "У приложения нет доступной для запуска активности, либо оно было отключено или удалено. " +
+                    "Список приложений обновлён.",
+            )
+        }
+    }
+
+    override fun showAppContextMenu(entry: AppEntry, anchor: View?, screenX: Int, screenY: Int) {
+        val pinned = prefs.isPinned(entry.key)
+        val onDesktop = prefs.isOnDesktop(entry.key)
+        val items = listOf(
+            MenuEntry.Header(entry.label),
+            MenuEntry.Item("Открыть", glyph = Glyph.EXTERNAL) { launchApp(entry, anchor) },
+            MenuEntry.Separator,
+            MenuEntry.Item(if (pinned) "Убрать из Dock" else "Закрепить в Dock", glyph = Glyph.PIN) {
+                setPinned(entry.key, !pinned)
+            },
+            MenuEntry.Item(if (onDesktop) "Убрать с рабочего стола" else "Добавить на рабочий стол", glyph = Glyph.DESKTOP) {
+                setOnDesktop(entry.key, !onDesktop)
+            },
+            MenuEntry.Separator,
+            MenuEntry.Item("Об этом приложении", glyph = Glyph.INFO) { openAppInfo(entry) },
+            MenuEntry.Item("Сведения в Android", glyph = Glyph.GEAR) {
+                if (!apps.openSystemAppInfo(this, entry)) toast("Не удалось открыть сведения о приложении")
+            },
         )
-
-        dock.addView(
-            item,
-            LinearLayout.LayoutParams(0, -2, 1f)
-        )
+        when {
+            screenX >= 0 && screenY >= 0 -> menus.showAtScreen(screenX, screenY, items)
+            anchor != null -> menus.show(anchor, items)
+            else -> {
+                val dm = resources.displayMetrics
+                menus.showAtScreen(dm.widthPixels / 2 - dp(110), dm.heightPixels / 3, items)
+            }
+        }
     }
 
-    private fun focusSearch() {
-        search.requestFocus()
-        search.setSelection(search.text.length)
+    // ---- DesktopHost: windows -----------------------------------------------------------------
 
-        val imm = getSystemService(INPUT_METHOD_SERVICE)
-            as InputMethodManager
-
-        imm.showSoftInput(search, InputMethodManager.SHOW_IMPLICIT)
+    private fun hideOverlays() {
+        menus.dismiss()
+        if (spotlight.isShowing) spotlight.hide()
+        if (launchpad.isShowing) launchpad.hide()
     }
 
-    private fun hideKeyboard() {
-        val imm = getSystemService(INPUT_METHOD_SERVICE)
-            as InputMethodManager
-
-        imm.hideSoftInputFromWindow(search.windowToken, 0)
+    override fun openFinder(newWindow: Boolean, placeUri: String?) {
+        hideOverlays()
+        val existing = windows.windows.filterIsInstance<FinderWindow>().lastOrNull()
+        val w = if (!newWindow && existing != null) {
+            windows.focus(existing)
+            existing
+        } else {
+            val id = windows.nextId("finder")
+            windows.open(id) { FinderWindow(this, id) }
+        }
+        if (placeUri != null) w.openPlace(placeUri)
     }
 
-    private fun openSettings() {
+    override fun openSettings(section: String?) {
+        hideOverlays()
+        val w = windows.open(SettingsWindow.ID) { SettingsWindow(this) }
+        if (section != null) w.showSection(section)
+    }
+
+    override fun openAppInfo(entry: AppEntry) {
+        hideOverlays()
+        windows.open("appinfo:${entry.key}") { AppInfoWindow(this, entry.key) }
+    }
+
+    override fun openAbout() {
+        hideOverlays()
+        windows.open("about") { AboutWindow(this) }
+    }
+
+    override fun openNotes() {
+        hideOverlays()
+        windows.open("notes") { NotesWindow(this) }
+    }
+
+    override fun openShortcuts() {
+        hideOverlays()
+        windows.open("shortcuts") { ShortcutsWindow(this) }
+    }
+
+    override fun openSystemSettings() {
         try {
-            startActivity(Intent(android.provider.Settings.ACTION_SETTINGS))
+            startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         } catch (_: Exception) {
-            Toast.makeText(this, "Настройки недоступны", Toast.LENGTH_SHORT).show()
+            toast("Системные настройки недоступны")
         }
     }
 
-    // Горячие клавиши для физической клавиатуры
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        if (event.isCtrlPressed && keyCode == KeyEvent.KEYCODE_SPACE) {
-            focusSearch()
+    override fun showLaunchpad() {
+        menus.dismiss()
+        if (spotlight.isShowing) spotlight.hide()
+        if (!launchpad.isShowing) launchpad.show()
+    }
+
+    override fun hideLaunchpad() {
+        if (launchpad.isShowing) launchpad.hide()
+    }
+
+    override fun toggleLaunchpad() {
+        if (launchpad.isShowing) hideLaunchpad() else showLaunchpad()
+    }
+
+    override fun showSpotlight(query: String) {
+        menus.dismiss()
+        spotlight.show(query)
+    }
+
+    override fun hideSpotlight() {
+        if (spotlight.isShowing) spotlight.hide()
+    }
+
+    override fun toggleSpotlight() {
+        if (spotlight.isShowing) hideSpotlight() else showSpotlight()
+    }
+
+    // ---- DesktopHost: storage -----------------------------------------------------------------
+
+    override fun pickFolder(callback: (Uri?) -> Unit) {
+        folderCallback = callback
+        try {
+            openTree.launch(null)
+        } catch (_: ActivityNotFoundException) {
+            folderCallback = null
+            callback(null)
+            toast("Выбор папок недоступен на этом устройстве")
+        }
+    }
+
+    override fun pickFile(mimeTypes: Array<String>, callback: (Uri?) -> Unit) {
+        fileCallback = callback
+        try {
+            openDocument.launch(mimeTypes)
+        } catch (_: ActivityNotFoundException) {
+            fileCallback = null
+            callback(null)
+            toast("Выбор файлов недоступен на этом устройстве")
+        }
+    }
+
+    override fun createDocument(mimeType: String, suggestedName: String, callback: (Uri?) -> Unit) {
+        createCallback = callback
+        try {
+            createDocumentLauncher.launch(mimeType to suggestedName)
+        } catch (_: ActivityNotFoundException) {
+            createCallback = null
+            callback(null)
+            toast("Сохранение файлов недоступно на этом устройстве")
+        }
+    }
+
+    override fun pickWallpaperImage() {
+        pickFile(arrayOf("image/*")) { uri ->
+            if (uri != null) {
+                wallpaper.setCustom(uri)
+                (windows.find(SettingsWindow.ID) as? SettingsWindow)?.rebuild()
+            }
+        }
+    }
+
+    // ---- DesktopHost: shared state ------------------------------------------------------------
+
+    override fun dockAnchor(windowId: String?): PointF = dock.anchorForWindow(windowId)
+
+    override fun onDockChanged() {
+        dock.refresh()
+        root.post { updateLayout() }
+    }
+
+    override fun onDesktopChanged() {
+        desktop.refresh()
+    }
+
+    override fun setPinned(key: String, pinned: Boolean) {
+        if (pinned) prefs.pin(key) else prefs.unpin(key)
+        onDockChanged()
+    }
+
+    override fun setOnDesktop(key: String, onDesktop: Boolean) {
+        if (onDesktop) desktop.addApp(key) else desktop.removeApp(key)
+    }
+
+    override fun arrangeDesktop() {
+        desktop.arrange()
+    }
+
+    override fun isDefaultLauncher(): Boolean = try {
+        getSystemService(RoleManager::class.java)?.isRoleHeld(RoleManager.ROLE_HOME) == true
+    } catch (_: Exception) {
+        false
+    }
+
+    override fun requestDefaultLauncher() {
+        try {
+            val rm = getSystemService(RoleManager::class.java)
+            if (rm != null && rm.isRoleAvailable(RoleManager.ROLE_HOME) && !rm.isRoleHeld(RoleManager.ROLE_HOME)) {
+                roleRequest.launch(rm.createRequestRoleIntent(RoleManager.ROLE_HOME))
+                return
+            }
+        } catch (_: Exception) {
+        }
+        try {
+            startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
+        } catch (_: Exception) {
+            toast("Откройте Настройки Android → Приложения → Приложения по умолчанию → Главный экран")
+        }
+    }
+
+    // ---- Keyboard -----------------------------------------------------------------------------
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (dialogs.isShowing) {
+            if (dialogs.handleKey(event)) return true
+            return super.dispatchKeyEvent(event)
+        }
+        if (event.action == KeyEvent.ACTION_DOWN && handleShortcut(event)) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * Global shortcuts. Ctrl and Meta (Win/Cmd) are treated alike. Ctrl+Space may be taken by
+     * Android for switching keyboard layouts on some devices, so Alt+Space and the Search key
+     * open Spotlight too.
+     */
+    private fun handleShortcut(e: KeyEvent): Boolean {
+        val ctrl = e.isCtrlPressed || e.isMetaPressed
+        val code = e.keyCode
+        if ((code == KeyEvent.KEYCODE_SPACE && (ctrl || e.isAltPressed)) || code == KeyEvent.KEYCODE_SEARCH) {
+            toggleSpotlight()
             return true
         }
-
-        if (event.isCtrlPressed && keyCode == KeyEvent.KEYCODE_L) {
-            focusSearch()
+        if (code == KeyEvent.KEYCODE_ESCAPE) return handleEscape(e)
+        if (code == KeyEvent.KEYCODE_F4 || (ctrl && e.isShiftPressed && code == KeyEvent.KEYCODE_A)) {
+            toggleLaunchpad()
             return true
         }
-
-        if (keyCode == KeyEvent.KEYCODE_ESCAPE) {
-            if (search.text.isNotEmpty()) {
-                search.setText("")
-                search.clearFocus()
-                hideKeyboard()
+        if (code == KeyEvent.KEYCODE_F10 || (ctrl && code == KeyEvent.KEYCODE_F2)) {
+            hideOverlays()
+            return menuBar.openMenuFromKeyboard()
+        }
+        if (ctrl && code == KeyEvent.KEYCODE_F3) {
+            hideOverlays()
+            return dock.focusDock()
+        }
+        if (!ctrl) return false
+        when (code) {
+            KeyEvent.KEYCODE_COMMA -> {
+                openSettings()
+                return true
+            }
+            KeyEvent.KEYCODE_L, KeyEvent.KEYCODE_F -> {
+                focusSearch()
+                return true
+            }
+            KeyEvent.KEYCODE_W -> {
+                if (spotlight.isShowing || launchpad.isShowing) {
+                    hideOverlays()
+                    return true
+                }
+                return windows.closeActive()
+            }
+            KeyEvent.KEYCODE_M -> return windows.minimizeActive()
+            KeyEvent.KEYCODE_N -> if (!e.isShiftPressed) {
+                openFinder(newWindow = true)
+                return true
+            }
+            KeyEvent.KEYCODE_GRAVE, KeyEvent.KEYCODE_TAB -> return windows.cycle()
+            KeyEvent.KEYCODE_SLASH -> {
+                openShortcuts()
                 return true
             }
         }
-
-        if (event.isCtrlPressed && keyCode == KeyEvent.KEYCODE_COMMA) {
-            openSettings()
-            return true
+        if (!spotlight.isShowing && !launchpad.isShowing) {
+            windows.activeWindow?.let { if (it.handleKey(e)) return true }
         }
-
-        return super.onKeyDown(keyCode, event)
+        return false
     }
 
-    private fun launchFirstSearchResult() {
-        if (!::allApps.isInitialized) return
-
-        val query = search.text.toString()
-        val first = allApps.firstOrNull {
-            it.name.contains(query, ignoreCase = true)
-        }
-
-        if (first != null) {
-            launchApp(first)
-        } else {
-            Toast.makeText(this, "Ничего не найдено", Toast.LENGTH_SHORT).show()
+    /** Ctrl+L / Ctrl+F: focus the search field of whatever is in front, else open Spotlight. */
+    private fun focusSearch() {
+        when {
+            launchpad.isShowing -> launchpad.focusSearch()
+            spotlight.isShowing -> spotlight.show()
+            else -> {
+                val w = windows.activeWindow
+                if (w == null || !w.focusSearchField()) showSpotlight()
+            }
         }
     }
 
-    private fun loadApps() {
-        val intent = Intent(Intent.ACTION_MAIN).apply {
-            addCategory(Intent.CATEGORY_LAUNCHER)
-        }
-
-        @Suppress("DEPRECATION")
-        allApps = packageManager.queryIntentActivities(intent, 0)
-            .mapNotNull { info ->
-                val packageName = info.activityInfo.packageName
-
-                if (packageName == applicationContext.packageName) {
-                    null
-                } else {
-                    AppItem(
-                        info.loadLabel(packageManager).toString(),
-                        packageName,
-                        info.loadIcon(packageManager)
-                    )
+    private fun handleEscape(e: KeyEvent): Boolean {
+        when {
+            menus.isShowing -> menus.dismiss()
+            spotlight.isShowing -> hideSpotlight()
+            launchpad.isShowing -> hideLaunchpad()
+            else -> {
+                val w = windows.activeWindow
+                if (w != null && w.handleKey(e)) return true
+                val f = currentFocus
+                if (f != null) {
+                    if (f is EditText) hideKeyboard(f)
+                    f.clearFocus()
                 }
+                windows.deactivateAll()
             }
-            .distinctBy { it.packageName }
-            .sortedBy { it.name.lowercase(Locale.getDefault()) }
+        }
+        return true
     }
 
-    private fun launchApp(app: AppItem) {
-        try {
-            val launchIntent =
-                packageManager.getLaunchIntentForPackage(app.packageName)
-
-            if (launchIntent != null) {
-                startActivity(launchIntent)
-            } else {
-                Toast.makeText(
-                    this,
-                    "Не удалось открыть ${app.name}",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        } catch (_: Exception) {
-            Toast.makeText(
-                this,
-                "Ошибка запуска ${app.name}",
-                Toast.LENGTH_SHORT
-            ).show()
-        }
+    private fun hideKeyboard(v: View) {
+        getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(v.windowToken, 0)
     }
 
-    private fun renderApps(query: String) {
-        if (!::appGrid.isInitialized || !::allApps.isInitialized) return
-
-        appGrid.removeAllViews()
-
-        val filtered = allApps.filter {
-            it.name.contains(query, ignoreCase = true)
-        }
-
-        val usableWidth = resources.displayMetrics.widthPixels - dp(40)
-        val columns = (usableWidth / dp(112)).coerceIn(3, 8)
-        appGrid.columnCount = columns
-
-        if (filtered.isEmpty()) {
-            val empty = text(
-                if (query.isBlank()) "Приложения не найдены"
-                else "Ничего не найдено",
-                15f,
-                muted
-            ).apply {
-                gravity = Gravity.CENTER
-                setPadding(dp(12), dp(24), dp(12), dp(24))
-            }
-
-            appGrid.addView(
-                empty,
-                GridLayout.LayoutParams().apply {
-                    width = usableWidth
-                    height = dp(90)
+    private fun setupBackHandling() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (handleBack()) return
+                if (!isDefaultLauncher()) {
+                    // Opened as a normal app: Back leaves MacPad.
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                    isEnabled = true
                 }
-            )
-            return
-        }
-
-        filtered.forEach { app ->
-            val tile = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                gravity = Gravity.CENTER
-                setPadding(dp(4), dp(8), dp(4), dp(8))
-                isClickable = true
-                isFocusable = true
-                background = rounded(Color.TRANSPARENT, dp(14).toFloat())
-
-                setOnFocusChangeListener { view, focused ->
-                    view.background = rounded(
-                        if (focused) panel else Color.TRANSPARENT,
-                        dp(14).toFloat()
-                    )
-                }
-
-                setOnClickListener { launchApp(app) }
             }
+        })
+    }
 
-            val icon = ImageView(this).apply {
-                setImageDrawable(app.icon)
-                scaleType = ImageView.ScaleType.FIT_CENTER
-                contentDescription = app.name
-            }
-
-            tile.addView(
-                icon,
-                LinearLayout.LayoutParams(dp(48), dp(48))
-            )
-
-            tile.addView(
-                text(app.name, 12f, white).apply {
-                    gravity = Gravity.CENTER
-                    maxLines = 2
-                    ellipsize = android.text.TextUtils.TruncateAt.END
-                    setPadding(0, dp(7), 0, 0)
-                },
-                LinearLayout.LayoutParams(-1, dp(42))
-            )
-
-            appGrid.addView(
-                tile,
-                GridLayout.LayoutParams().apply {
-                    width = usableWidth / columns
-                    height = dp(92)
-                    setMargins(0, 0, 0, dp(4))
-                }
-            )
+    private fun handleBack(): Boolean = when {
+        dialogs.isShowing -> dialogs.dismissTop()
+        menus.isShowing -> {
+            menus.dismiss()
+            true
         }
+        spotlight.isShowing -> {
+            hideSpotlight()
+            true
+        }
+        launchpad.isShowing -> {
+            hideLaunchpad()
+            true
+        }
+        windows.activeWindow != null -> windows.closeActive()
+        else -> false
     }
 }
