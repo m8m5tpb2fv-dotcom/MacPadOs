@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MacPad launcher icon foreground: a desktop window with traffic lights and a Dock. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- window -->
+    <path
+        android:fillColor="#F2FFFFFF"
+        android:pathData="M37,33h34a7,7 0,0 1,7 7v22a7,7 0,0 1,-7 7h-34a7,7 0,0 1,-7 -7v-22a7,7 0,0 1,7 -7z" />
+    <!-- title bar separator -->
+    <path
+        android:fillColor="#1F000000"
+        android:pathData="M30,42.2h48v0.8h-48z" />
+    <!-- traffic lights -->
+    <path android:fillColor="#FFFF5F57" android:pathData="M37.6,37.6m-1.9,0a1.9,1.9 0,1 1,3.8 0a1.9,1.9 0,1 1,-3.8 0" />
+    <path android:fillColor="#FFFEBC2E" android:pathData="M43.2,37.6m-1.9,0a1.9,1.9 0,1 1,3.8 0a1.9,1.9 0,1 1,-3.8 0" />
+    <path android:fillColor="#FF28C840" android:pathData="M48.8,37.6m-1.9,0a1.9,1.9 0,1 1,3.8 0a1.9,1.9 0,1 1,-3.8 0" />
+    <!-- content lines -->
+    <path android:fillColor="#336A3FB0" android:pathData="M37,48h22a1.5,1.5 0,0 1,0 3h-22a1.5,1.5 0,0 1,0 -3z" />
+    <path android:fillColor="#226A3FB0" android:pathData="M37,54h30a1.5,1.5 0,0 1,0 3h-30a1.5,1.5 0,0 1,0 -3z" />
+    <!-- dock -->
+    <path
+        android:fillColor="#CCFFFFFF"
+        android:pathData="M42,72h24a3.5,3.5 0,0 1,0 7h-24a3.5,3.5 0,0 1,0 -7z" />
+    <path android:fillColor="#FF0A84FF" android:pathData="M45.5,75.5m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
+    <path android:fillColor="#FFFF9F0A" android:pathData="M51.8,75.5m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
+    <path android:fillColor="#FF30D158" android:pathData="M58.1,75.5m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
+    <path android:fillColor="#FFBF5AF2" android:pathData="M64.4,75.5m-2,0a2,2 0,1 1,4 0a2,2 0,1 1,-4 0" />
+</vector>
