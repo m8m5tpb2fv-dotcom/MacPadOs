@@ -16,6 +16,7 @@ import android.os.StatFs
 import android.provider.Settings
 import android.text.format.Formatter
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
@@ -271,6 +272,29 @@ class AboutWindow(host: DesktopHost) : MacWindow(host, "about") {
         if (rows != null) refresh()
     }
 
+    /** Rebuilding while a finger or button is down would cancel that click: wait for the release. */
+    private var touching = false
+    private var pendingRows: List<Pair<String, String>>? = null
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> touching = true
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                touching = false
+                if (pendingRows != null) post { applyPending() }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun applyPending() {
+        val data = pendingRows ?: return
+        if (closed || touching) return
+        pendingRows = null
+        rows = data
+        rebuild()
+    }
+
     override fun onClosed() {
         closed = true
         io.shutdownNow()
@@ -289,9 +313,9 @@ class AboutWindow(host: DesktopHost) : MacWindow(host, "about") {
         io.execute {
             val data = compute(ctx, screen)
             main.post {
-                if (closed || my != generation) return@post
-                rows = data
-                rebuild()
+                if (closed || my != generation || data == rows) return@post
+                pendingRows = data
+                applyPending()
             }
         }
     }

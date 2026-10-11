@@ -447,6 +447,9 @@ class DesktopIconsLayer(private val host: DesktopHost) : FrameLayout(host.contex
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     if (e.isButtonPressed(MotionEvent.BUTTON_SECONDARY)) {
+                        // The release still arrives as ACTION_UP: mark it handled so it does not launch.
+                        longFired = true
+                        dragging = false
                         showIconMenu(this)
                         return true
                     }

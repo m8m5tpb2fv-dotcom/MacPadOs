@@ -22,6 +22,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 import java.util.concurrent.Executors
 
 /**
@@ -283,7 +286,15 @@ class NotesWindow(host: DesktopHost) : MacWindow(host, "notes") {
                     }
                     out.toByteArray()
                 } ?: throw IOException("Нет доступа к файлу")
-                content = String(bytes, Charsets.UTF_8)
+                // Strict decoding: a lenient one would replace bytes of a non-UTF-8 file (e.g.
+                // Windows-1251) with "�", and saving would then destroy the original text.
+                content = Charsets.UTF_8.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes))
+                    .toString()
+            } catch (_: CharacterCodingException) {
+                error = "Файл не в кодировке UTF-8. Заметки открывают только текст в UTF-8, чтобы не испортить файл при сохранении."
             } catch (_: FileTooLarge) {
                 error = "Файл слишком большой (больше 2 МБ)."
             } catch (e: Exception) {

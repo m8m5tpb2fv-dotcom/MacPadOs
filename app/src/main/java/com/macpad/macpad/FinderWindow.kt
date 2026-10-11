@@ -87,8 +87,9 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
     private var folderFlags = 0
     private var state = State.WELCOME
     private var errorText = ""
-    private var generation = 0
-    private var searchGeneration = 0
+    /** Bumped on every folder load; read by background tasks to drop stale work. */
+    @Volatile private var generation = 0
+    @Volatile private var searchGeneration = 0
     private var filter = ""
     private var searchResults: List<Doc>? = null
     private var searching = false
@@ -98,10 +99,16 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
     private var lastWide: Boolean? = null
     private var lastShowSidebar: Boolean? = null
     private var suppressSearchWatcher = false
+    /** The file list had keyboard focus: give it back when the list is recreated. */
+    private var keepListFocus = false
+    /** Prefs as last shown, to notice changes made in Settings (see [onActivated]). */
+    private var shownPlaceUris: List<String> = host.prefs.finderPlaces.map { it.uri }
+    private var shownHidden = host.prefs.finderShowHidden
 
     // Views (recreated by build()).
     private var backButton: ImageView? = null
     private var forwardButton: ImageView? = null
+    private var upButton: ImageView? = null
     private var folderLabel: TextView? = null
     private var listButton: ImageView? = null
     private var gridButton: ImageView? = null
@@ -127,8 +134,9 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
 
     /** Navigates to the root of a granted folder (one of prefs.finderPlaces). */
     fun openPlace(uri: String) {
+        // Unknown URI: name it from the URI itself, without a provider query on the UI thread.
         val p = host.prefs.finderPlaces.firstOrNull { it.uri == uri }
-            ?: FinderPlace(uri, FinderPlaces.displayName(context, Uri.parse(uri)))
+            ?: FinderPlace(uri, Uri.decode(Uri.parse(uri).lastPathSegment.orEmpty()).substringAfterLast(':').substringAfterLast('/').ifBlank { "Папка" })
         navigateTo(p, emptyList(), record = true)
     }
 
@@ -143,8 +151,10 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
         }
         backButton = ctx.glyphButton(p, Glyph.CHEVRON_LEFT, "Назад") { goBack() }
         forwardButton = ctx.glyphButton(p, Glyph.CHEVRON_RIGHT, "Вперёд") { goForward() }
+        upButton = ctx.glyphButton(p, Glyph.CHEVRON_UP, "Вверх") { goUp() }
         bar.addView(backButton)
         bar.addView(forwardButton)
+        bar.addView(upButton)
         folderLabel = ctx.label(title, 14f, p.text, 600).apply { setPadding(dp(6), 0, dp(6), 0) }
         bar.addView(folderLabel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         bar.addView(ctx.glyphButton(p, Glyph.SIDEBAR, "Боковая панель") {
@@ -205,6 +215,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
                 }
             }
         }
+        field.setOnFocusChangeListener { _, focused -> if (focused) keepListFocus = false }
         searchField = field
         bar.addView(field, LinearLayout.LayoutParams(dp(170), dp(36)).apply { marginStart = dp(6) })
         updateToolbar()
@@ -214,6 +225,8 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
     private fun updateToolbar() {
         backButton?.let { it.isEnabled = back.isNotEmpty(); it.alpha = if (back.isNotEmpty()) 1f else 0.35f }
         forwardButton?.let { it.isEnabled = forward.isNotEmpty(); it.alpha = if (forward.isNotEmpty()) 1f else 0.35f }
+        val canGoUp = path.size > 1
+        upButton?.let { it.isEnabled = canGoUp; it.alpha = if (canGoUp) 1f else 0.35f }
         folderLabel?.text = title
         listButton?.isSelected = viewMode == "list"
         gridButton?.isSelected = viewMode == "grid"
@@ -276,6 +289,29 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
         }
     }
 
+    /**
+     * Settings can add or remove folders and toggle hidden files while this window stays open.
+     * Posted, and only when something changed, so the click that activated the window still
+     * reaches its target.
+     */
+    override fun onActivated() {
+        post {
+            if (closed) return@post
+            val places = host.prefs.finderPlaces
+            val uris = places.map { it.uri }
+            val placesChanged = uris != shownPlaceUris
+            val hiddenChanged = host.prefs.finderShowHidden != shownHidden
+            if (!placesChanged && !hiddenChanged) return@post
+            val current = place
+            when {
+                current != null && current.uri in shownPlaceUris && current.uri !in uris -> onPlaceRemoved(current)
+                current == null && places.isNotEmpty() -> navigateTo(places.first(), emptyList(), record = false)
+                hiddenChanged && current != null -> refresh()
+            }
+            renderSidebar()
+        }
+    }
+
     override fun onClosed() {
         closed = true
         generation++
@@ -290,6 +326,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
     // ---- Sidebar ----------------------------------------------------------------------------
 
     private fun renderSidebar() {
+        shownPlaceUris = host.prefs.finderPlaces.map { it.uri }
         val side = sidebarBox ?: return
         side.removeAllViews()
         side.addView(sidebarHeader("Места"))
@@ -375,6 +412,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
         val box = mainBox ?: return
         val p = palette
         val ctx = context
+        if (itemsView?.hasFocus() == true) keepListFocus = true
         box.removeAllViews()
         adapter = null
         itemsView = null
@@ -405,6 +443,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
                     box.addView(centered(ctx.label(msg, 13f, p.textSecondary)))
                 } else {
                     box.addView(if (viewMode == "grid") gridView(docs) else listView(docs))
+                    if (keepListFocus && searchField?.hasFocus() != true) itemsView?.requestFocus()
                 }
             }
         }
@@ -489,6 +528,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
             setPadding(dp(6), dp(4), dp(6), dp(4))
             clipToPadding = false
             isFocusable = true
+            isFocusableInTouchMode = true
         }
         wireItems(list)
         column.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -509,6 +549,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
             setPadding(dp(12), dp(12), dp(12), dp(12))
             clipToPadding = false
             isFocusable = true
+            isFocusableInTouchMode = true
         }
         wireItems(grid)
         return grid
@@ -516,13 +557,17 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
 
     private fun wireItems(view: AbsListView) {
         itemsView = view
+        // Plain keys (Enter, Delete, F5…) reach the list only while it has focus, and a tap
+        // does not focus an AbsListView by itself.
         view.setOnItemClickListener { _, _, position, _ ->
             val d = adapter?.items?.getOrNull(position) ?: return@setOnItemClickListener
+            view.requestFocus()
             select(d.docId)
             open(d)
         }
         view.setOnItemLongClickListener { _, v, position, _ ->
             val d = adapter?.items?.getOrNull(position) ?: return@setOnItemLongClickListener false
+            view.requestFocus()
             select(d.docId)
             showItemMenu(d, v, -1f, -1f)
             true
@@ -539,6 +584,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
             if (e.actionMasked == MotionEvent.ACTION_DOWN && e.isButtonPressed(MotionEvent.BUTTON_SECONDARY)) {
                 val pos = view.pointToPosition(e.x.toInt(), e.y.toInt())
                 val d = adapter?.items?.getOrNull(pos)
+                view.requestFocus()
                 if (d != null) {
                     select(d.docId)
                     showItemMenu(d, null, e.rawX, e.rawY)
@@ -667,7 +713,10 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
         if (!thumbRequested.add(d.docId)) return
         val cr = context.contentResolver
         val size = dp(112)
+        val my = generation
         thumbIo.execute {
+            // Skip the backlog of a folder the user already left.
+            if (closed || my != generation) return@execute
             val bmp = try {
                 DocumentsContract.getDocumentThumbnail(cr, DocumentsContract.buildDocumentUriUsingTree(tree, d.docId), Point(size, size), null)
             } catch (_: Exception) {
@@ -787,6 +836,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
         }
         val cr = context.contentResolver
         val showHidden = host.prefs.finderShowHidden
+        shownHidden = showHidden
         io.execute {
             var docs: List<Doc>? = null
             var flags = 0
@@ -986,7 +1036,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
     private fun rename(d: Doc) {
         val uri = docUri(d) ?: return
         host.dialogs.prompt("Переименовать", null, d.name, "Переименовать") { newName ->
-            if (newName == d.name) return@prompt
+            if (newName == d.name || closed) return@prompt
             val cr = context.contentResolver
             io.execute {
                 val error = try {
@@ -1006,6 +1056,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
     private fun delete(d: Doc) {
         val uri = docUri(d) ?: return
         host.dialogs.confirm("Удалить «${d.name}»?", "Это действие нельзя отменить.", "Удалить", destructive = true) {
+            if (closed) return@confirm
             val cr = context.contentResolver
             io.execute {
                 val error = try {
@@ -1031,6 +1082,7 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
         }
         val parent = DocumentsContract.buildDocumentUriUsingTree(tree, path.last().docId)
         host.dialogs.prompt("Новая папка", null, "Новая папка", "Создать") { name ->
+            if (closed) return@prompt
             val cr = context.contentResolver
             io.execute {
                 val error = try {
@@ -1059,16 +1111,28 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
 
     private fun addPlace() {
         host.pickFolder { uri ->
-            if (uri != null) {
-                val p = FinderPlaces.add(host.context, host.prefs, uri)
-                renderSidebar()
-                navigateTo(p, emptyList(), record = true)
+            if (uri == null || closed) return@pickFolder
+            val appContext = host.context.applicationContext
+            val prefs = host.prefs
+            // FinderPlaces.add queries the provider for the folder name: keep it off the UI thread.
+            io.execute {
+                val p = FinderPlaces.add(appContext, prefs, uri)
+                main.post {
+                    if (closed) return@post
+                    renderSidebar()
+                    navigateTo(p, emptyList(), record = true)
+                }
             }
         }
     }
 
     private fun removePlace(pl: FinderPlace) {
         FinderPlaces.remove(host.context, host.prefs, pl)
+        onPlaceRemoved(pl)
+    }
+
+    /** Leaves [pl] if it is shown, after it was removed from prefs (here or in Settings). */
+    private fun onPlaceRemoved(pl: FinderPlace) {
         if (place?.uri == pl.uri) {
             back.clear()
             forward.clear()
@@ -1091,21 +1155,27 @@ class FinderWindow(host: DesktopHost, id: String) : MacWindow(host, id) {
 
     private fun pickAndOpenFile() {
         host.pickFile(arrayOf("*/*")) { uri ->
-            if (uri == null) return@pickFile
-            val type = try {
-                host.context.contentResolver.getType(uri)
-            } catch (_: Exception) {
-                null
-            } ?: "*/*"
-            try {
-                host.activity.startActivity(
-                    Intent.createChooser(
-                        Intent(Intent.ACTION_VIEW).setDataAndType(uri, type).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
-                        "Открыть с помощью",
-                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                )
-            } catch (_: Exception) {
-                host.toast("Нет приложения для открытия этого файла")
+            if (uri == null || closed) return@pickFile
+            val cr = host.context.contentResolver
+            io.execute {
+                val type = try {
+                    cr.getType(uri)
+                } catch (_: Exception) {
+                    null
+                } ?: "*/*"
+                main.post {
+                    if (closed) return@post
+                    try {
+                        host.activity.startActivity(
+                            Intent.createChooser(
+                                Intent(Intent.ACTION_VIEW).setDataAndType(uri, type).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                                "Открыть с помощью",
+                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    } catch (_: Exception) {
+                        host.toast("Нет приложения для открытия этого файла")
+                    }
+                }
             }
         }
     }

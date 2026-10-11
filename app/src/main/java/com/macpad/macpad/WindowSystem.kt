@@ -68,6 +68,11 @@ abstract class MacWindow(val host: DesktopHost, val windowId: String) : FrameLay
     var isMaximized = false
         internal set
     internal var restoreBounds: Rect? = null
+    /**
+     * Bounds the user chose (open, drag, resize, restore). The layer can shrink for a while (soft
+     * keyboard, Dock size, rotation); the window is fitted from these, so it grows back after.
+     */
+    internal var wanted: Rect? = null
 
     /** Scaled screenshot taken when minimized (shown in the Dock). */
     var snapshot: Bitmap? = null
@@ -441,6 +446,7 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         w.x = left.toFloat()
         w.y = top.toFloat()
         clamp(w, width, height)
+        w.wanted = boundsOf(w)
         stack.add(w)
         focus(w)
         if (host.animationsEnabled) {
@@ -578,13 +584,14 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         if (!w.resizable || !stack.contains(w)) return
         if (w.isMinimized) restore(w)
         if (!w.isMaximized) {
-            w.restoreBounds = boundsOf(w)
+            w.restoreBounds = w.wanted ?: boundsOf(w)
             w.isMaximized = true
             animateBounds(w, Rect(0, 0, layerW(), layerH()))
         } else {
             w.isMaximized = false
             val r = w.restoreBounds ?: defaultRect(w)
-            animateBounds(w, r)
+            w.wanted = Rect(r)
+            animateBounds(w, fitted(r))
             saveBounds(w)
         }
         focus(w)
@@ -628,13 +635,16 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
                 setBounds(w, Rect(0, 0, lw, lh))
             } else {
                 val lp = w.layoutParams ?: return@forEach
-                val nw = min(lp.width, lw)
-                val nh = min(lp.height, lh)
+                val want = w.wanted ?: boundsOf(w).also { w.wanted = it }
+                val nw = min(want.width(), lw)
+                val nh = min(want.height(), lh)
                 if (nw != lp.width || nh != lp.height) {
                     lp.width = nw
                     lp.height = nh
                     w.layoutParams = lp
                 }
+                w.x = want.left.toFloat()
+                w.y = want.top.toFloat()
                 clamp(w, nw, nh)
                 w.onBoundsChanged()
             }
@@ -663,6 +673,8 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         w.x = x
         w.y = y
         clamp(w, lp.width, lp.height)
+        val want = w.wanted
+        w.wanted = if (want == null) boundsOf(w) else Rect(w.x.roundToInt(), w.y.roundToInt(), w.x.roundToInt() + want.width(), w.y.roundToInt() + want.height())
     }
 
     internal fun resizeTo(w: MacWindow, width: Int, height: Int) {
@@ -673,6 +685,7 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         lp.height = height.coerceIn(min(w.dp(w.minHeightDp), layerH()), maxH)
         w.layoutParams = lp
         if (w.isMaximized) w.isMaximized = false
+        w.wanted = boundsOf(w)
         w.onBoundsChanged()
     }
 
@@ -683,7 +696,9 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         val rel = if (w.width > 0) ((rawX - loc[0] - w.x) / w.width).coerceIn(0f, 1f) else 0.5f
         val newLeft = (rawX - loc[0] - r.width() * rel).roundToInt()
         w.isMaximized = false
-        setBounds(w, Rect(newLeft, w.y.roundToInt(), newLeft + r.width(), w.y.roundToInt() + r.height()))
+        val target = Rect(newLeft, w.y.roundToInt(), newLeft + r.width(), w.y.roundToInt() + r.height())
+        w.wanted = Rect(target)
+        setBounds(w, fitted(target))
         notifyChanged()
     }
 
@@ -737,8 +752,12 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         }
     }
 
+    /** [r] limited to the current layer size (the layer may be shrunk by the soft keyboard). */
+    private fun fitted(r: Rect): Rect =
+        Rect(r.left, r.top, r.left + min(r.width(), layerW()), r.top + min(r.height(), layerH()))
+
     private fun saveBounds(w: MacWindow) {
-        val r = if (w.isMaximized) w.restoreBounds else boundsOf(w)
+        val r = if (w.isMaximized) w.restoreBounds else (w.wanted ?: boundsOf(w))
         if (r != null && r.width() > 0 && r.height() > 0) host.prefs.setWindowBounds(w.boundsKey, r)
     }
 

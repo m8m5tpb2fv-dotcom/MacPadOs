@@ -70,9 +70,11 @@ object WindowKit {
         }
         addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         if (control != null) {
-            addView(control, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                marginStart = ctx.dp(12)
-            })
+            // Keep a size the caller set: glyph images have no intrinsic size and would collapse.
+            val lp = (control.layoutParams as? ViewGroup.MarginLayoutParams)?.let { LinearLayout.LayoutParams(it) }
+                ?: LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.marginStart = ctx.dp(12)
+            addView(control, lp)
         }
         if (onClick != null) {
             background = ctx.stateBackground(p, ctx.dpf(8f))

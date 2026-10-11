@@ -134,6 +134,8 @@ class AppRepository(context: Context) {
 
     /** Reloads the full list in the background and notifies listeners on the main thread. */
     fun reload() {
+        // A posted reload or a menu action can arrive after shutdown(): execute() would throw.
+        if (executor.isShutdown) return
         executor.execute {
             val list = try {
                 loadAll()
@@ -156,6 +158,7 @@ class AppRepository(context: Context) {
      * launchable activities differs from what is shown (e.g. a callback was missed).
      */
     fun refreshIfChanged() {
+        if (executor.isShutdown) return
         executor.execute {
             val keys = try {
                 profiles().flatMap { user ->

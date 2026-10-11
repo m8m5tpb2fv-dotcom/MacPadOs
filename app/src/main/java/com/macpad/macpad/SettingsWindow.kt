@@ -105,6 +105,7 @@ class SettingsWindow(host: DesktopHost) : MacWindow(host, ID) {
     private var sidebar: LinearLayout? = null
     private var content: LinearLayout? = null
     private var contentScroll: ScrollView? = null
+    private var shownExternalState = ""
 
     /** Thumbnail views of the wallpaper section currently on screen, by wallpaper id. */
     private val thumbViews = HashMap<String, ImageView>()
@@ -130,7 +131,7 @@ class SettingsWindow(host: DesktopHost) : MacWindow(host, ID) {
     fun showSection(section: String) {
         current = if (sections.any { it.id == section }) section else SECTION_APPEARANCE
         renderSidebar()
-        renderContent()
+        renderContent(resetScroll = true)
     }
 
     override fun onCreateContent(): View {
@@ -171,9 +172,18 @@ class SettingsWindow(host: DesktopHost) : MacWindow(host, ID) {
     }
 
     override fun onActivated() {
-        // The default-launcher state or granted folders may have changed in Android settings.
-        if (current == SECTION_LAUNCHER || current == SECTION_FINDER) renderContent()
+        // The default-launcher state or granted folders may have changed in Android settings or
+        // Finder. Re-render only on a change, and posted: onActivated runs while the click that
+        // activated the window is being dispatched, and new views would swallow it.
+        if (current != SECTION_LAUNCHER && current != SECTION_FINDER) return
+        post {
+            if (!closed && (current == SECTION_LAUNCHER || current == SECTION_FINDER) && externalState() != shownExternalState) renderContent()
+        }
     }
+
+    /** State shown by the Finder and Main screen sections that can change outside this window. */
+    private fun externalState(): String =
+        host.isDefaultLauncher().toString() + "|" + host.prefs.finderPlaces.joinToString("|") { it.uri + "=" + FinderPlaces.hasAccess(context, it.uri) }
 
     override fun onClosed() {
         closed = true
@@ -220,8 +230,10 @@ class SettingsWindow(host: DesktopHost) : MacWindow(host, ID) {
 
     // ---- Content ----------------------------------------------------------------------------
 
-    private fun renderContent() {
+    private fun renderContent(resetScroll: Boolean = false) {
         val body = content ?: return
+        val scrollY = if (resetScroll) 0 else contentScroll?.scrollY ?: 0
+        shownExternalState = externalState()
         body.removeAllViews()
         thumbViews.clear()
         val section = sections.firstOrNull { it.id == current } ?: sections.first()
@@ -238,7 +250,9 @@ class SettingsWindow(host: DesktopHost) : MacWindow(host, ID) {
             SECTION_KEYBOARD -> keyboard(body)
             SECTION_ABOUT -> about(body)
         }
-        contentScroll?.scrollTo(0, 0)
+        // Buttons inside a page (↑ ↓ ✕, switches) re-render it: keep the user's place.
+        val scroll = contentScroll
+        if (scrollY == 0) scroll?.scrollTo(0, 0) else scroll?.post { scroll.scrollTo(0, scrollY) }
     }
 
     private fun LinearLayout.add(v: View, topDp: Int = 0) {
@@ -670,9 +684,13 @@ class SettingsWindow(host: DesktopHost) : MacWindow(host, ID) {
             buttons(
                 ctx.macButton(p, "Добавить папку…") {
                     host.pickFolder { uri ->
-                        if (uri != null) {
-                            FinderPlaces.add(host.context, host.prefs, uri)
-                            renderContent()
+                        if (uri == null || closed) return@pickFolder
+                        val appContext = host.context.applicationContext
+                        val prefs = host.prefs
+                        // FinderPlaces.add queries the provider for the folder name: keep it off the UI thread.
+                        io.execute {
+                            FinderPlaces.add(appContext, prefs, uri)
+                            main.post { if (!closed) renderContent() }
                         }
                     }
                 },

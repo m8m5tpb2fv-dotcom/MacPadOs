@@ -1,5 +1,7 @@
 package com.macpad.macpad
 
+import android.content.Context
+import android.view.FocusFinder
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -30,6 +32,12 @@ class DialogLayer(private val host: DesktopHost, private val root: FrameLayout) 
 
     private class Shown(val overlay: View, val buttons: List<DialogButton>)
 
+    /** Scrim that keeps keyboard focus inside the dialog, so keys never reach the desktop behind. */
+    private class ModalFrame(context: Context) : FrameLayout(context) {
+        override fun focusSearch(focused: View?, direction: Int): View? =
+            FocusFinder.getInstance().findNextFocus(this, focused, direction) ?: focused
+    }
+
     private val stack = mutableListOf<Shown>()
 
     val isShowing: Boolean get() = stack.isNotEmpty()
@@ -56,7 +64,7 @@ class DialogLayer(private val host: DesktopHost, private val root: FrameLayout) 
     ) {
         val ctx = host.context
         val p = host.palette
-        val overlay = FrameLayout(ctx).apply {
+        val overlay = ModalFrame(ctx).apply {
             setBackgroundColor(p.dimOverlay)
             isClickable = true
             isFocusable = false
@@ -104,10 +112,13 @@ class DialogLayer(private val host: DesktopHost, private val root: FrameLayout) 
             gravity = Gravity.END
         }
         val shown = Shown(overlay, buttons)
+        val buttonViews = ArrayList<View>()
         buttons.forEachIndexed { i, b ->
             val btn = ctx.macButton(p, b.text, b.style) {
-                if (b.action()) dismiss(shown)
+                // Ignore clicks while the dialog fades out (a repeated Enter on the focused button).
+                if (stack.contains(shown) && b.action()) dismiss(shown)
             }
+            buttonViews += btn
             row.addView(btn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
                 if (i > 0) marginStart = ctx.dp(10)
             })
@@ -128,7 +139,14 @@ class DialogLayer(private val host: DesktopHost, private val root: FrameLayout) 
             panel.scaleY = 0.92f
             panel.animate().scaleX(1f).scaleY(1f).setDuration(160).start()
         }
-        onShown?.invoke(panel)
+        if (onShown != null) {
+            onShown(panel)
+        } else {
+            // Move focus off the desktop (a list, an editor) into the dialog. From touch mode a
+            // plain requestFocus() would fail for a button.
+            val i = buttons.indexOfFirst { it.isDefault }.coerceAtLeast(0)
+            buttonViews.getOrNull(i)?.requestFocusFromTouch()
+        }
     }
 
     fun alert(title: String, message: String?) {
@@ -214,6 +232,10 @@ class DialogLayer(private val host: DesktopHost, private val root: FrameLayout) 
     private fun dismiss(s: Shown) {
         if (!stack.remove(s)) return
         val v = s.overlay
+        (v as? ViewGroup)?.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+        v.findFocus()?.clearFocus()
+        // A dialog shown from another dialog: give focus back to the one below.
+        stack.lastOrNull()?.overlay?.requestFocus()
         if (host.animationsEnabled) {
             v.animate().alpha(0f).setDuration(110).withEndAction { root.removeView(v) }.start()
         } else {
