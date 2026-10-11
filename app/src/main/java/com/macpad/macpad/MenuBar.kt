@@ -505,7 +505,8 @@ class MenuBar(private val host: DesktopHost) : FrameLayout(host.context) {
         return listOf(
             MenuEntry.Item("Новое окно Finder", shortcut = "Ctrl+N") { host.openFinder(newWindow = true) },
             MenuEntry.Item("Открыть файл…") { openFile() },
-            MenuEntry.Item("Новая заметка") { host.openNotes() },
+            // Notes is a single document, so this opens it rather than promising a new note.
+            MenuEntry.Item("Открыть Заметки") { host.openNotes() },
             MenuEntry.Separator,
             MenuEntry.Item("Закрыть окно", shortcut = "Ctrl+W", enabled = wm.activeWindow != null) { wm.closeActive() },
             MenuEntry.Item("Закрыть все окна", enabled = wm.windows.isNotEmpty()) { wm.closeAll() },

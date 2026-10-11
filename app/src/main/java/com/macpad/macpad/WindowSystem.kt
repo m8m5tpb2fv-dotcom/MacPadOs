@@ -19,6 +19,7 @@ import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.animation.AccelerateInterpolator
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -68,6 +69,11 @@ abstract class MacWindow(val host: DesktopHost, val windowId: String) : FrameLay
     var isMaximized = false
         internal set
     internal var restoreBounds: Rect? = null
+    /**
+     * Bounds the user chose (open, drag, resize, restore). The layer can shrink for a while (soft
+     * keyboard, Dock size, rotation); the window is fitted from these, so it grows back after.
+     */
+    internal var wanted: Rect? = null
 
     /** Scaled screenshot taken when minimized (shown in the Dock). */
     var snapshot: Bitmap? = null
@@ -365,6 +371,7 @@ abstract class MacWindow(val host: DesktopHost, val windowId: String) : FrameLay
 class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
 
     private val stack = mutableListOf<MacWindow>()
+    private val genies = HashMap<MacWindow, GenieView>()
     private val listeners = mutableListOf<() -> Unit>()
     private var notifying = false
     private var notifyAgain = false
@@ -441,13 +448,16 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         w.x = left.toFloat()
         w.y = top.toFloat()
         clamp(w, width, height)
+        w.wanted = boundsOf(w)
         stack.add(w)
         focus(w)
         if (host.animationsEnabled) {
+            // macOS: the new window grows from slightly smaller with a soft settle.
             w.alpha = 0f
-            w.scaleX = 0.94f
-            w.scaleY = 0.94f
-            w.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(190).setInterpolator(DecelerateInterpolator()).start()
+            w.scaleX = 0.86f
+            w.scaleY = 0.86f
+            w.animate().alpha(1f).setDuration(160).setInterpolator(DecelerateInterpolator()).start()
+            w.animate().scaleX(1f).scaleY(1f).setDuration(300).setInterpolator(OvershootInterpolator(0.9f)).start()
         }
         notifyChanged()
         return w
@@ -496,7 +506,8 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         if (!stack.contains(w)) return
         saveBounds(w)
         stack.remove(w)
-        val wasMinimized = w.isMinimized
+        val hadGenie = genies.remove(w)?.let { it.stop(); true } ?: false
+        val wasMinimized = w.isMinimized || hadGenie
         w.isActive = false
         try {
             w.onClosed()
@@ -507,7 +518,9 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
             w.snapshot = null
         }
         if (host.animationsEnabled && !wasMinimized) {
-            w.animate().alpha(0f).scaleX(0.96f).scaleY(0.96f).setDuration(140).withEndAction(done).start()
+            w.animate().cancel()
+            w.animate().alpha(0f).scaleX(0.9f).scaleY(0.9f).setDuration(170)
+                .setInterpolator(AccelerateInterpolator()).withEndAction(done).start()
         } else {
             done()
         }
@@ -530,18 +543,12 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
             w.onDeactivated()
         }
         notifyChanged()
-        val finish = {
+        w.animate().cancel()
+        w.scaleX = 1f
+        w.scaleY = 1f
+        w.alpha = 1f
+        if (!runGenie(w, minimizing = true) { if (w.isMinimized) w.visibility = View.GONE }) {
             w.visibility = View.GONE
-            w.scaleX = 1f
-            w.scaleY = 1f
-            w.alpha = 1f
-        }
-        if (host.animationsEnabled && w.width > 0) {
-            setPivotToDock(w)
-            w.animate().scaleX(0.06f).scaleY(0.06f).alpha(0f).setDuration(260)
-                .setInterpolator(AccelerateInterpolator()).withEndAction(finish).start()
-        } else {
-            finish()
         }
         stack.lastOrNull { !it.isMinimized }?.let { focus(it) }
     }
@@ -553,38 +560,68 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
             return
         }
         w.isMinimized = false
-        w.visibility = View.VISIBLE
-        if (host.animationsEnabled && w.width > 0) {
-            setPivotToDock(w)
-            w.scaleX = 0.06f
-            w.scaleY = 0.06f
-            w.alpha = 0f
-            w.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(240).setInterpolator(DecelerateInterpolator()).start()
+        // Genie back out of the Dock; the real window appears when the effect ends.
+        if (!runGenie(w, minimizing = false) { if (!w.isMinimized && stack.contains(w)) w.visibility = View.VISIBLE }) {
+            w.visibility = View.VISIBLE
         }
         w.snapshot = null
         focus(w)
         notifyChanged()
     }
 
-    private fun setPivotToDock(w: MacWindow) {
-        val target = host.dockAnchor(w.windowId)
-        val loc = IntArray(2)
-        layer.getLocationOnScreen(loc)
-        w.pivotX = target.x - loc[0] - w.x
-        w.pivotY = target.y - loc[1] - w.y
+    /**
+     * Plays the genie effect between [w] and its Dock icon (into the Dock when [minimizing],
+     * out of it otherwise). An effect already running for [w] is reversed from where it is.
+     * Returns false when nothing was started; [done] then is not called.
+     */
+    private fun runGenie(w: MacWindow, minimizing: Boolean, done: () -> Unit): Boolean {
+        val old = genies.remove(w)
+        old?.stop()
+        if (!host.animationsEnabled || w.width <= 0 || w.height <= 0) return false
+        val parent = layer.parent as? ViewGroup ?: return false
+        val bmp = capture(w, min(w.width.toFloat(), w.dpf(720f))) ?: return false
+        val pLoc = IntArray(2)
+        val lLoc = IntArray(2)
+        parent.getLocationOnScreen(pLoc)
+        layer.getLocationOnScreen(lLoc)
+        val from = RectF(boundsOf(w))
+        from.offset((lLoc[0] - pLoc[0]).toFloat(), (lLoc[1] - pLoc[1]).toFloat())
+        val anchor = host.dockAnchor(w.windowId)
+        val box = w.dpf(46f)
+        val k = min(box / from.width(), box / from.height())
+        val tw = from.width() * k
+        val th = from.height() * k
+        val ax = anchor.x - pLoc[0]
+        val ay = anchor.y - pLoc[1]
+        val to = RectF(ax - tw / 2f, ay - th / 2f, ax + tw / 2f, ay + th / 2f)
+        val g = GenieView(host.context, bmp, from, to)
+        g.progress = old?.progress ?: if (minimizing) 0f else 1f
+        val index = parent.indexOfChild(layer) + 1
+        parent.addView(g, index, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        genies[w] = g
+        if (minimizing) w.visibility = View.INVISIBLE
+        val target = if (minimizing) 1f else 0f
+        val full = if (minimizing) 520f else 460f
+        g.animateTo(target, (full * abs(target - g.progress)).toLong()) {
+            if (genies[w] === g) genies.remove(w)
+            parent.removeView(g)
+            done()
+        }
+        return true
     }
 
     fun toggleMaximize(w: MacWindow) {
         if (!w.resizable || !stack.contains(w)) return
         if (w.isMinimized) restore(w)
         if (!w.isMaximized) {
-            w.restoreBounds = boundsOf(w)
+            w.restoreBounds = w.wanted ?: boundsOf(w)
             w.isMaximized = true
             animateBounds(w, Rect(0, 0, layerW(), layerH()))
         } else {
             w.isMaximized = false
             val r = w.restoreBounds ?: defaultRect(w)
-            animateBounds(w, r)
+            w.wanted = Rect(r)
+            animateBounds(w, fitted(r))
             saveBounds(w)
         }
         focus(w)
@@ -628,13 +665,16 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
                 setBounds(w, Rect(0, 0, lw, lh))
             } else {
                 val lp = w.layoutParams ?: return@forEach
-                val nw = min(lp.width, lw)
-                val nh = min(lp.height, lh)
+                val want = w.wanted ?: boundsOf(w).also { w.wanted = it }
+                val nw = min(want.width(), lw)
+                val nh = min(want.height(), lh)
                 if (nw != lp.width || nh != lp.height) {
                     lp.width = nw
                     lp.height = nh
                     w.layoutParams = lp
                 }
+                w.x = want.left.toFloat()
+                w.y = want.top.toFloat()
                 clamp(w, nw, nh)
                 w.onBoundsChanged()
             }
@@ -663,6 +703,8 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         w.x = x
         w.y = y
         clamp(w, lp.width, lp.height)
+        val want = w.wanted
+        w.wanted = if (want == null) boundsOf(w) else Rect(w.x.roundToInt(), w.y.roundToInt(), w.x.roundToInt() + want.width(), w.y.roundToInt() + want.height())
     }
 
     internal fun resizeTo(w: MacWindow, width: Int, height: Int) {
@@ -673,6 +715,7 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         lp.height = height.coerceIn(min(w.dp(w.minHeightDp), layerH()), maxH)
         w.layoutParams = lp
         if (w.isMaximized) w.isMaximized = false
+        w.wanted = boundsOf(w)
         w.onBoundsChanged()
     }
 
@@ -683,7 +726,9 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         val rel = if (w.width > 0) ((rawX - loc[0] - w.x) / w.width).coerceIn(0f, 1f) else 0.5f
         val newLeft = (rawX - loc[0] - r.width() * rel).roundToInt()
         w.isMaximized = false
-        setBounds(w, Rect(newLeft, w.y.roundToInt(), newLeft + r.width(), w.y.roundToInt() + r.height()))
+        val target = Rect(newLeft, w.y.roundToInt(), newLeft + r.width(), w.y.roundToInt() + r.height())
+        w.wanted = Rect(target)
+        setBounds(w, fitted(target))
         notifyChanged()
     }
 
@@ -737,15 +782,19 @@ class WindowManager(private val host: DesktopHost, val layer: FrameLayout) {
         }
     }
 
+    /** [r] limited to the current layer size (the layer may be shrunk by the soft keyboard). */
+    private fun fitted(r: Rect): Rect =
+        Rect(r.left, r.top, r.left + min(r.width(), layerW()), r.top + min(r.height(), layerH()))
+
     private fun saveBounds(w: MacWindow) {
-        val r = if (w.isMaximized) w.restoreBounds else boundsOf(w)
+        val r = if (w.isMaximized) w.restoreBounds else (w.wanted ?: boundsOf(w))
         if (r != null && r.width() > 0 && r.height() > 0) host.prefs.setWindowBounds(w.boundsKey, r)
     }
 
-    private fun capture(w: MacWindow): Bitmap? {
+    private fun capture(w: MacWindow, maxWidthPx: Float = w.dpf(360f)): Bitmap? {
         if (w.width <= 0 || w.height <= 0) return null
         return try {
-            val scale = min(1f, w.dpf(360f) / w.width)
+            val scale = min(1f, maxWidthPx / w.width)
             val bw = max(1, (w.width * scale).roundToInt())
             val bh = max(1, (w.height * scale).roundToInt())
             val bmp = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)

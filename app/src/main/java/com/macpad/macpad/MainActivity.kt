@@ -174,6 +174,13 @@ class MainActivity : AppCompatActivity(), DesktopHost {
     override fun onDestroy() {
         apps.removeListener(appsListener)
         windows.removeListener(windowsListener)
+        // Let open windows stop their executors and unregister listeners (Notes also saves).
+        windows.windows.forEach {
+            try {
+                it.onClosed()
+            } catch (_: Exception) {
+            }
+        }
         apps.shutdown()
         wallpaper.shutdown()
         super.onDestroy()
@@ -591,7 +598,8 @@ class MainActivity : AppCompatActivity(), DesktopHost {
             toggleLaunchpad()
             return true
         }
-        if (code == KeyEvent.KEYCODE_F10 || (ctrl && code == KeyEvent.KEYCODE_F2)) {
+        // Shift+F10 is the context-menu key for the focused item, handled by the views.
+        if ((code == KeyEvent.KEYCODE_F10 && !e.isShiftPressed) || (ctrl && code == KeyEvent.KEYCODE_F2)) {
             hideOverlays()
             return menuBar.openMenuFromKeyboard()
         }
